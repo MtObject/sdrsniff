@@ -15,11 +15,30 @@ const PublicKey = union(PublicKeyAlgorithm) {
     ed25519: Ed25519.PublicKey,
 };
 
+const Certificate = struct {
+    public_key: PublicKey,
+    identity: ?[]const u8,
+    app_ids: []const u32,
+    time_created: u32,
+    time_expiry: u32,
+
+    fn deinit(self: *Certificate, alloc: std.mem.Allocator) void {
+        if (self.identity) |identity| {
+            alloc.free(identity);
+        }
+        alloc.free(self.app_ids);
+    }
+
+    fn keyID(self: Certificate) u64 {
+        return calculateKeyID(self.public_key);
+    }
+};
+
 // i'd love to know why valve stores this as an ssh public key
 const root_public_key_hex = "9aeca04e1751ce6268d569002ca1e1fa1b2dbc26d36b4ea3a0083ad372829b84";
 
 alloc: std.mem.Allocator,
-certs: std.AutoHashMapUnmanaged(KeyID, PublicKey),
+certs: std.AutoHashMapUnmanaged(KeyID, Certificate),
 
 pub fn init(alloc: std.mem.Allocator) error{OutOfMemory}!CertStore {
     var self = CertStore{
@@ -27,38 +46,54 @@ pub fn init(alloc: std.mem.Allocator) error{OutOfMemory}!CertStore {
         .certs = .empty,
     };
 
-    // FIXME: cleanup block
-    comptime var root_public_key_bytes: [32]u8 = undefined;
-    _ = try comptime std.fmt.hexToBytes(&root_public_key_bytes, root_public_key_hex);
-    const root_public_key_inner = try comptime Ed25519.PublicKey.fromBytes(root_public_key_bytes);
-    const root_public_key = PublicKey{
-        .ed25519 = root_public_key_inner,
+    const root_certificate = Certificate{
+        .public_key = .{
+            .ed25519 = comptime blk: {
+                var bytes: [32]u8 = undefined;
+                _ = std.fmt.hexToBytes(&bytes, root_public_key_hex) catch unreachable;
+                break :blk Ed25519.PublicKey.fromBytes(bytes) catch unreachable;
+            },
+        },
+        .identity = null,
+        .app_ids = &.{},
+        .time_created = 0,
+        .time_expiry = 0,
     };
-    try self.certs.put(self.alloc, calculateKeyID(root_public_key), root_public_key);
+    try self.certs.put(self.alloc, root_certificate.keyID(), root_certificate);
 
     return self;
 }
 
 pub fn deinit(self: *CertStore) void {
+    var cert_iter = self.certs.valueIterator();
+    while (cert_iter.next()) |cert| {
+        cert.deinit(self.alloc);
+    }
+
     self.certs.deinit(self.alloc);
 }
 
-pub fn addCACert(self: *CertStore, signed_certificate: proto.steam.CMsgSteamDatagramCertificateSigned) !KeyID {
-    const signature_bytes = signed_certificate.ca_signature orelse return error.MissingSignature;
-    const certificate_bytes = signed_certificate.cert orelse return error.MissingCert;
+pub fn addCACert(self: *CertStore, signed_certificate: proto.steam.CMsgSteamDatagramCertificateSigned) !void {
+    const certificate = try self.parseCertificate(self.alloc, signed_certificate);
+    const key_id = certificate.keyID();
 
-    if (!self.verify(certificate_bytes, signature_bytes, signed_certificate.ca_key_id orelse return error.MissingCAKeyID)) {
-        return error.InvalidSignature;
-    }
+    try self.certs.put(self.alloc, key_id, certificate);
+    log.debug("added ca cert {}", .{key_id});
+}
+
+pub fn parseCertificate(self: *CertStore, alloc: std.mem.Allocator, signed_certificate: proto.steam.CMsgSteamDatagramCertificateSigned) !Certificate {
+    const signature_bytes = signed_certificate.ca_signature orelse return error.NoSignature;
+    const certificate_bytes = signed_certificate.cert orelse return error.NoCertificate;
 
     // TODO: check expiry, revocation, blah blah blah
     var certificate_reader = std.Io.Reader.fixed(certificate_bytes);
-    var certificate = try proto.steam.CMsgSteamDatagramCertificate.decode(&certificate_reader, self.alloc);
-    defer certificate.deinit(self.alloc);
+    var certificate_proto = try proto.steam.CMsgSteamDatagramCertificate.decode(&certificate_reader, self.alloc);
+    defer certificate_proto.deinit(self.alloc);
 
-    const public_key: PublicKey = switch (certificate.key_type orelse .INVALID) {
+    const public_key: PublicKey = switch (certificate_proto.key_type orelse .INVALID) {
+        .INVALID, _ => return error.InvalidKeyType,
         .ED25519 => blk: {
-            const key_data = certificate.key_data orelse &[_]u8{};
+            const key_data = certificate_proto.key_data.?;
             if (key_data.len != Ed25519.PublicKey.encoded_length) {
                 return error.InvalidPublicKey;
             }
@@ -67,21 +102,36 @@ pub fn addCACert(self: *CertStore, signed_certificate: proto.steam.CMsgSteamData
                 .ed25519 = try Ed25519.PublicKey.fromBytes(key_data[0..Ed25519.PublicKey.encoded_length].*),
             };
         },
-        .INVALID, _ => return error.InvalidKeyType,
     };
-    const key_id = calculateKeyID(public_key);
-    try self.certs.put(self.alloc, key_id, public_key);
 
-    log.debug("added ca cert {}, valid for apps: {any}", .{ key_id, certificate.app_ids.items });
+    const identity = if (certificate_proto.identity_string) |identity|
+        try alloc.dupe(u8, identity)
+    else
+        null;
+    const app_ids = try alloc.dupe(u32, certificate_proto.app_ids.items);
 
-    return key_id;
+    const certificate = Certificate{
+        .public_key = public_key,
+        .identity = identity,
+        .app_ids = app_ids,
+        .time_created = certificate_proto.time_created orelse 0,
+        .time_expiry = certificate_proto.time_expiry orelse 0,
+    };
+
+    const parent_ = self.certs.get(signed_certificate.ca_key_id orelse 0);
+    if (parent_) |parent| {
+        if (!verify(certificate_bytes, signature_bytes, parent)) {
+            return error.InvalidSignature;
+        }
+    } else {
+        std.log.warn("could not find CA with id {}, skipping verification", .{signed_certificate.ca_key_id orelse 0});
+    }
+
+    return certificate;
 }
 
-pub fn verify(self: *CertStore, data: []const u8, signature: []const u8, ca_key_id: KeyID) bool {
-    const parent_public_key = self.certs.get(ca_key_id) orelse {
-        return false;
-    };
-    switch (parent_public_key) {
+pub fn verify(data: []const u8, signature: []const u8, certificate: Certificate) bool {
+    switch (certificate.public_key) {
         .ed25519 => |parent_public_key_ed25119| {
             if (signature.len != Ed25519.Signature.encoded_length) {
                 return false;
