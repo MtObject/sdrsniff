@@ -1,0 +1,21 @@
+.{
+    .name = .sdrsniff,
+    .version = "0.0.0",
+    .fingerprint = 0xcb156feaca02e51e,
+    .minimum_zig_version = "0.16.0-dev.2145+ec25b1384",
+    .dependencies = .{
+        .npcap_sdk = .{
+            .url = "https://npcap.com/dist/npcap-sdk-1.16.zip",
+            .hash = "N-V-__8AAHZREgDsPG_0dSx3Q8U9P3tGeSbxWMcpW5V3CQlv",
+        },
+        .protobuf = .{
+            .url = "git+https://github.com/Arwalk/zig-protobuf?ref=zig-master#c3f8fdc4d0761af7e4edb064fd1248e50574b262",
+            .hash = "protobuf-3.0.0-0e82aohXKQDcG92gcsmBaK7hZ9PVbwcCND1hyCEtzgd9",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
